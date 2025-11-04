@@ -22,7 +22,7 @@ if not RAW_DB_URL:
     raise RuntimeError("DATABASE_URL не задан в .env")
 
 if RAW_DB_URL.startswith("postgresql://"):
-    SQLA_DB_URL = RAW_DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+    SQLA_DB_URL = RAW_DB_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 else:
     SQLA_DB_URL = RAW_DB_URL
 
