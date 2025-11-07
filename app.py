@@ -50,7 +50,7 @@ security = HTTPBearer()
 def create_token(level: int) -> str:
     payload = {
         "level": level,
-        "exp": datetime.utcnow() + timedelta(hours=12)
+        "exp": datetime.now() + timedelta(hours=12)
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -225,7 +225,7 @@ def add_record(payload: AddRecordIn, level: int = Depends(require_write)):
             user_name=payload.user_name,
             boxid=payload.boxid,
             ttn=payload.ttn,
-            datetime=datetime.utcnow(),
+            datetime=datetime.now(),
             note=note
         )
         db.add(rec)
@@ -243,7 +243,7 @@ def add_record(payload: AddRecordIn, level: int = Depends(require_write)):
                 user_name=payload.user_name,
                 boxid=payload.boxid,
                 ttn=payload.ttn,
-                datetime=datetime.utcnow(),
+                datetime=datetime.now(),
                 error_message=err_msg
             )
             db.add(err)
@@ -315,7 +315,7 @@ def add_error(payload: AddErrorIn, level: int = Depends(require_write)):
             user_name=payload.user_name,
             boxid=payload.boxid,
             ttn=payload.ttn,
-            datetime=datetime.utcnow(),
+            datetime=datetime.now(),
             error_message=payload.message
         )
         db.add(err)
