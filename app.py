@@ -56,10 +56,10 @@ ROLE_LEVELS = {
 }
 
 # Базовые пароли уровня доступа сохраняются для обратной совместимости и админ-входа
-PASSWORDS = {
-    "301993": ROLE_LEVELS["admin"],
-    "123123123": ROLE_LEVELS["operator"],
-    "321321321": ROLE_LEVELS["viewer"],
+ROLE_PASSWORDS = {
+    "admin": "301993",
+    "operator": "123123123",
+    "viewer": "321321321",
 }
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -85,6 +85,20 @@ def create_token(level: int, *, user_id: Optional[int] = None, surname: Optional
     if surname is not None:
         payload["surname"] = surname
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_role_for_password(password: str) -> Optional[str]:
+    for role, stored_password in ROLE_PASSWORDS.items():
+        if stored_password == password:
+            return role
+    return None
+
+
+def set_role_password_value(role: str, password: str) -> None:
+    current_password = ROLE_PASSWORDS.get(role)
+    if current_password == password:
+        return
+    ROLE_PASSWORDS[role] = password
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
@@ -282,6 +296,10 @@ class UpdateUserIn(BaseModel):
     is_active: Optional[bool] = None
 
 
+class RolePasswordSetIn(BaseModel):
+    password: str = Field(..., min_length=3)
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -358,8 +376,11 @@ def login(
     if not password:
         raise HTTPException(status_code=400, detail="Пароль обов'язковий")
 
+    password = password.strip()
+
     # Вход по персональным данным
     if surname:
+        surname = surname.strip()
         db = get_session()
         try:
             stmt = select(User).where(User.surname.ilike(surname))
@@ -376,10 +397,10 @@ def login(
             db.close()
 
     # Вход по прежним паролям (администратор и вспомогательные доступы)
-    if password not in PASSWORDS:
+    role = get_role_for_password(password)
+    if role is None:
         raise HTTPException(status_code=401, detail="Невірний пароль")
-    level = PASSWORDS[password]
-    role = next((name for name, lvl in ROLE_LEVELS.items() if lvl == level), "operator")
+    level = ROLE_LEVELS[role]
     token = create_token(level)
     return LoginResponse(token=token, access_level=level, role=role)
 
@@ -401,10 +422,13 @@ def admin_login(
     if not password:
         raise HTTPException(status_code=400, detail="Пароль адміністратора обов'язковий")
 
-    level = PASSWORDS.get(password)
-    if level != ROLE_LEVELS["admin"]:
+    password = password.strip()
+
+    role = get_role_for_password(password)
+    if role != "admin":
         raise HTTPException(status_code=401, detail="Невірний пароль адміністратора")
 
+    level = ROLE_LEVELS["admin"]
     token = create_token(level)
     return LoginResponse(token=token, access_level=level, role="admin")
 
@@ -676,17 +700,20 @@ def set_user_activity(
 
 @app.get("/admin/role-passwords")
 def get_role_passwords(_: dict = Depends(require_admin)):
-    return PASSWORDS
+    return dict(ROLE_PASSWORDS)
 
 
 @app.post("/admin/role-passwords/{role}")
 def set_role_password(
     role: str,
-    password: str = Query(..., min_length=3),
+    payload: RolePasswordSetIn,
     _: dict = Depends(require_admin),
 ):
     role = ensure_role(role)
-    PASSWORDS[password] = ROLE_LEVELS[role]
+    new_password = payload.password.strip()
+    if not new_password:
+        raise HTTPException(status_code=400, detail="Пароль не може бути порожнім")
+    set_role_password_value(role, new_password)
     return {"status": "updated", "role": role}
 
 
