@@ -384,6 +384,31 @@ def login(
     return LoginResponse(token=token, access_level=level, role=role)
 
 
+@app.post("/admin_login", response_model=LoginResponse)
+def admin_login(
+    payload: Optional[LoginRequest] = Body(
+        default=None,
+        description="Пароль адміністратора. Якщо не переданий, використовується query-параметр",
+    ),
+    password: Optional[str] = Query(
+        default=None,
+        description="Пароль адміністратора для швидкого входу",
+    ),
+):
+    if payload is not None:
+        password = payload.password
+
+    if not password:
+        raise HTTPException(status_code=400, detail="Пароль адміністратора обов'язковий")
+
+    level = PASSWORDS.get(password)
+    if level != ROLE_LEVELS["admin"]:
+        raise HTTPException(status_code=401, detail="Невірний пароль адміністратора")
+
+    token = create_token(level)
+    return LoginResponse(token=token, access_level=level, role="admin")
+
+
 @app.post("/register", response_model=RegistrationRequestOut)
 def register(payload: RegistrationIn):
     db = get_session()
