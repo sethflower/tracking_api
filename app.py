@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, HTTPException, Depends, Path
+from fastapi import FastAPI, Query, HTTPException, Depends, Path, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field, ConfigDict
@@ -336,16 +336,37 @@ def root():
 
 
 @app.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest):
+def login(
+    payload: Optional[LoginRequest] = Body(
+        default=None,
+        description="Данные для входа. Если не переданы, используются query-параметры",
+    ),
+    password: Optional[str] = Query(
+        default=None,
+        description="Пароль доступа или пароль пользователя (для обратной сумісності)",
+    ),
+    surname: Optional[str] = Query(
+        default=None,
+        description="Фамилия пользователя при входе по особистому паролю",
+    ),
+):
+    if payload is not None:
+        # Приоритет у тела запроса, щоб працювало з оновленим фронтендом
+        password = payload.password
+        surname = payload.surname
+
+    if not password:
+        raise HTTPException(status_code=400, detail="Пароль обов'язковий")
+
     # Вход по персональным данным
-    if payload.surname:
+    if surname:
         db = get_session()
         try:
-            stmt = select(User).where(User.surname.ilike(payload.surname))
+            stmt = select(User).where(User.surname.ilike(surname))
             user = db.execute(stmt).scalar_one_or_none()
             if not user or not user.is_active:
                 raise HTTPException(status_code=401, detail="Користувач не активний або не існує")
-            if not verify_password(payload.password, user.password_hash):
+            if not verify_password(password, user.password_hash):
                 raise HTTPException(status_code=401, detail="Невірний пароль")
             role = ensure_role(user.role)
             level = ROLE_LEVELS[role]
@@ -355,9 +376,9 @@ def login(payload: LoginRequest):
             db.close()
 
     # Вход по прежним паролям (администратор и вспомогательные доступы)
-    if payload.password not in PASSWORDS:
+    if password not in PASSWORDS:
         raise HTTPException(status_code=401, detail="Невірний пароль")
-    level = PASSWORDS[payload.password]
+    level = PASSWORDS[password]
     role = next((name for name, lvl in ROLE_LEVELS.items() if lvl == level), "operator")
     token = create_token(level)
     return LoginResponse(token=token, access_level=level, role=role)
