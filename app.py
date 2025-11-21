@@ -113,7 +113,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     except Exception:
         raise HTTPException(status_code=401, detail="Невірний або протермінований токен")
 
+POWERBI_KEY = os.getenv("POWERBI_KEY")
 
+def verify_powerbi_key(key: str):
+    if key != POWERBI_KEY:
+        raise HTTPException(status_code=401, detail="Invalid PowerBI key")
+        
 def require_admin(payload: dict = Depends(verify_token)) -> dict:
     if int(payload.get("level", -1)) != ROLE_LEVELS["admin"]:
         raise HTTPException(status_code=403, detail="Доступ тільки для адміністратора")
