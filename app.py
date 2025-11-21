@@ -901,6 +901,48 @@ def set_help(payload: HelpSetIn, _: dict = Depends(require_admin)):
         db.close()
 
 
+@app.get("/powerbi/data")
+def powerbi_data(key: str = Query(...)):
+    verify_powerbi_key(key)
+
+    db = get_session()
+    try:
+        tracking = db.execute(
+            select(Tracking).order_by(Tracking.datetime.desc())
+        ).scalars().all()
+
+        errors = db.execute(
+            select(ErrorLog).order_by(ErrorLog.datetime.desc())
+        ).scalars().all()
+
+        return {
+            "tracking": [
+                {
+                    "id": r.id,
+                    "user_name": r.user_name,
+                    "boxid": r.boxid,
+                    "ttn": r.ttn,
+                    "datetime": r.datetime.isoformat(),
+                    "note": r.note or ""
+                }
+                for r in tracking
+            ],
+            "errors": [
+                {
+                    "id": e.id,
+                    "user_name": e.user_name,
+                    "boxid": e.boxid,
+                    "ttn": e.ttn,
+                    "datetime": e.datetime.isoformat(),
+                    "error": e.error_message
+                }
+                for e in errors
+            ]
+        }
+    finally:
+        db.close()
+
+
 @app.delete("/purge_all")
 def purge_all(_: dict = Depends(require_admin)):
     """
