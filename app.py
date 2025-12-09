@@ -203,6 +203,29 @@ class RegistrationRequest(Base):
     created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
 
 
+class ParcelUser(Base):
+    __tablename__ = "parcel_users"
+    __table_args__ = (UniqueConstraint("username", name="uq_parcel_users_username"),)
+
+    id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(SA_Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class ParcelScan(Base):
+    __tablename__ = "parcel_scans"
+
+    id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(SA_Integer, nullable=False)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    parcel_number: Mapped[str] = mapped_column(SA_Text, nullable=False)
+    scanned_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
+    
 with engine.begin() as conn:
     Base.metadata.create_all(conn)
     conn.execute(text(
@@ -266,6 +289,31 @@ class AddErrorIn(BaseModel):
     boxid: str
     ttn: str
     message: str
+
+class ParcelUserRegisterIn(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=6)
+
+
+class ParcelUserLoginIn(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class ParcelAuthResponse(BaseModel):
+    token: str
+    username: str
+
+
+class ParcelScanIn(BaseModel):
+    parcel_number: str = Field(..., min_length=1)
+
+
+class ParcelScanOut(BaseModel):
+    status: str
+    username: str
+    parcel_number: str
+    scanned_at: datetime
 
 
 class LoginRequest(BaseModel):
@@ -350,6 +398,31 @@ def ensure_role(role: str) -> str:
     if role not in ROLE_LEVELS:
         raise HTTPException(status_code=400, detail="Невідомий рівень доступу")
     return role
+
+def create_parcel_token(user_id: int, username: str) -> str:
+    payload = {
+        "scope": "parcel",
+        "parcel_user_id": user_id,
+        "username": username,
+        "exp": datetime.now() + timedelta(hours=12),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_parcel_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("scope") != "parcel" or "parcel_user_id" not in payload:
+            raise HTTPException(status_code=401, detail="Невірний токен для додатку посилок")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Термін дії токена минув")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Невірний або протермінований токен")
+
+
+def require_parcel_user(payload: dict = Depends(verify_parcel_token)) -> dict:
+    return payload
 
 
 # ---------------------- Эндпоинты ----------------------
@@ -436,6 +509,80 @@ def admin_login(
     level = ROLE_LEVELS["admin"]
     token = create_token(level)
     return LoginResponse(token=token, access_level=level, role="admin")
+
+@app.post("/parcel/register", response_model=ParcelAuthResponse)
+def parcel_register(payload: ParcelUserRegisterIn):
+    db = get_session()
+    try:
+        username = payload.username.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="Ім'я користувача не може бути порожнім")
+
+        existing_user = db.execute(
+            select(ParcelUser.id).where(ParcelUser.username.ilike(username))
+        ).first()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="Користувач з таким ім'ям вже існує")
+
+        user = ParcelUser(username=username, password_hash=hash_password(payload.password))
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        token = create_parcel_token(user.id, user.username)
+        return ParcelAuthResponse(token=token, username=user.username)
+    finally:
+        db.close()
+
+
+@app.post("/parcel/login", response_model=ParcelAuthResponse)
+def parcel_login(payload: ParcelUserLoginIn):
+    db = get_session()
+    try:
+        username = payload.username.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="Ім'я користувача не може бути порожнім")
+
+        user = db.execute(select(ParcelUser).where(ParcelUser.username.ilike(username))).scalar_one_or_none()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=401, detail="Користувач не активний або не існує")
+
+        if not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Невірний пароль")
+
+        token = create_parcel_token(user.id, user.username)
+        return ParcelAuthResponse(token=token, username=user.username)
+    finally:
+        db.close()
+
+
+@app.post("/parcel/scans", response_model=ParcelScanOut)
+def create_parcel_scan(payload: ParcelScanIn, auth: dict = Depends(require_parcel_user)):
+    parcel_number = payload.parcel_number.strip()
+    if not parcel_number:
+        raise HTTPException(status_code=400, detail="Номер посилки не може бути порожнім")
+
+    db = get_session()
+    try:
+        scan = ParcelScan(
+            user_id=int(auth["parcel_user_id"]),
+            username=auth.get("username", ""),
+            parcel_number=parcel_number,
+            scanned_at=datetime.utcnow(),
+        )
+        db.add(scan)
+        db.commit()
+        db.refresh(scan)
+        return ParcelScanOut(
+            status="recorded",
+            username=scan.username,
+            parcel_number=scan.parcel_number,
+            scanned_at=scan.scanned_at,
+        )
+    finally:
+        db.close()
+
+
 
 
 @app.post("/register", response_model=RegistrationRequestOut)
