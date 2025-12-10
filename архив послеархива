@@ -1607,15 +1607,68 @@ def set_help(payload: HelpSetIn, _: dict = Depends(require_admin)):
 
 
 @app.get("/powerbi/data")
-def powerbi_data(key: str = Query(...)):
+def powerbi_data(
+    key: str = Query(...),
+    username: Optional[str] = Query(default=None),
+    parcel_number: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
+    from_time: Optional[str] = Query(default=None),
+    to_time: Optional[str] = Query(default=None),
+):
     verify_powerbi_key(key)
 
     db = get_session()
+    scanpak_db = get_scanpak_session()
+
     try:
-        tracking = db.execute(select(Tracking).order_by(Tracking.datetime.desc())).scalars().all()
+        # ------- TRACKING -------
+        tracking = db.execute(
+            select(Tracking).order_by(Tracking.datetime.desc())
+        ).scalars().all()
 
-        errors = db.execute(select(ErrorLog).order_by(ErrorLog.datetime.desc())).scalars().all()
+        # ------- ERRORS -------
+        errors = db.execute(
+            select(ErrorLog).order_by(ErrorLog.datetime.desc())
+        ).scalars().all()
 
+        # ------- SCANPAK HISTORY (как /scanpak/history) -------
+        stmt = select(ParcelScan).where(text("1=1"))
+
+        if username:
+            stmt = stmt.where(ParcelScan.username.ilike(f"{username}%"))
+
+        if parcel_number:
+            stmt = stmt.where(ParcelScan.parcel_number.ilike(f"{parcel_number}%"))
+
+        if date:
+            try:
+                start = datetime.fromisoformat(date + " 00:00:00")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date: очікується формат YYYY-MM-DD")
+            end = start + timedelta(days=1)
+            stmt = stmt.where(
+                and_(ParcelScan.scanned_at >= start, ParcelScan.scanned_at < end)
+            )
+
+        stmt = stmt.order_by(ParcelScan.scanned_at.desc())
+        history_rows = scanpak_db.execute(stmt).scalars().all()
+
+        # фильтр по времени
+        start_time = parse_time_param(from_time, "from_time")
+        end_time = parse_time_param(to_time, "to_time")
+
+        if start_time or end_time:
+            def within(ts: datetime):
+                t = ts.time()
+                if start_time and t < start_time:
+                    return False
+                if end_time and t > end_time:
+                    return False
+                return True
+
+            history_rows = [r for r in history_rows if within(r.scanned_at)]
+
+        # ------- JSON -------
         return {
             "tracking": [
                 {
@@ -1624,7 +1677,7 @@ def powerbi_data(key: str = Query(...)):
                     "boxid": r.boxid,
                     "ttn": r.ttn,
                     "datetime": r.datetime.isoformat(),
-                    "note": r.note or ""
+                    "note": r.note or "",
                 }
                 for r in tracking
             ],
@@ -1635,13 +1688,26 @@ def powerbi_data(key: str = Query(...)):
                     "boxid": e.boxid,
                     "ttn": e.ttn,
                     "datetime": e.datetime.isoformat(),
-                    "error": e.error_message
+                    "error": e.error_message,
                 }
                 for e in errors
-            ]
+            ],
+            "scanpak_history": [
+                {
+                    "id": s.id,
+                    "user_id": s.user_id,
+                    "username": s.username,
+                    "parcel_number": s.parcel_number,
+                    "scanned_at": s.scanned_at.isoformat(),
+                }
+                for s in history_rows
+            ],
         }
+
     finally:
         db.close()
+        scanpak_db.close()
+
 
 
 @app.delete("/purge_all")
