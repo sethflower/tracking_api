@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Optional, List
 
 from dotenv import load_dotenv
@@ -427,6 +427,16 @@ class ParcelScanOut(BaseModel):
     scanned_at: datetime
 
 
+class ParcelScanHistoryItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    username: str
+    parcel_number: str
+    scanned_at: datetime
+
+
 class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, description="Пароль доступа или пароль пользователя")
     surname: Optional[str] = Field(None, description="Фамилия пользователя для входа по личному паролю")
@@ -481,6 +491,20 @@ def get_session():
 
 def get_scanpak_session():
     return ScanPakSessionLocal()
+
+
+def sanitize_digits(raw: str) -> str:
+    return "".join(ch for ch in raw if ch.isdigit())
+
+
+def parse_time_param(value: Optional[str], name: str) -> Optional[time]:
+    if value is None:
+        return None
+    try:
+        hour, minute = map(int, value.split(":"))
+        return time(hour, minute)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{name}: очікується формат HH:MM")
 
 
 def check_duplicates(db, boxid: str, ttn: str):
@@ -1022,7 +1046,7 @@ def parcel_login(payload: ParcelUserLoginIn):
 @app.post("/scanpak/parcel/scans", response_model=ParcelScanOut)
 @app.post("/parcel/scans", response_model=ParcelScanOut)
 def create_parcel_scan(payload: ParcelScanIn, auth: dict = Depends(require_parcel_user)):
-    parcel_number = payload.parcel_number.strip()
+    parcel_number = sanitize_digits(payload.parcel_number)
     if not parcel_number:
         raise HTTPException(status_code=400, detail="Номер посилки не може бути порожнім")
 
@@ -1043,6 +1067,86 @@ def create_parcel_scan(payload: ParcelScanIn, auth: dict = Depends(require_parce
             parcel_number=scan.parcel_number,
             scanned_at=scan.scanned_at,
         )
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/scans", response_model=ParcelScanOut)
+def create_scanpak_scan(payload: ParcelScanIn, auth: dict = Depends(require_scanpak_write)):
+    parcel_number = sanitize_digits(payload.parcel_number)
+    if not parcel_number:
+        raise HTTPException(status_code=400, detail="Номер посилки не може бути порожнім")
+
+    user_id = auth.get("user_id")
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="У токені відсутній ідентифікатор користувача")
+
+    username = auth.get("surname", "") or "невідомий користувач"
+
+    db = get_scanpak_session()
+    try:
+        scan = ParcelScan(
+            user_id=int(user_id),
+            username=username,
+            parcel_number=parcel_number,
+            scanned_at=datetime.utcnow(),
+        )
+        db.add(scan)
+        db.commit()
+        db.refresh(scan)
+        return ParcelScanOut(
+            status="recorded",
+            username=scan.username,
+            parcel_number=scan.parcel_number,
+            scanned_at=scan.scanned_at,
+        )
+    finally:
+        db.close()
+
+
+@app.get("/scanpak/history", response_model=List[ParcelScanHistoryItem])
+def get_scanpak_history(
+    username: Optional[str] = Query(default=None),
+    parcel_number: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None, description="Формат YYYY-MM-DD"),
+    from_time: Optional[str] = Query(default=None, description="Формат HH:MM"),
+    to_time: Optional[str] = Query(default=None, description="Формат HH:MM"),
+    _: dict = Depends(require_scanpak_read),
+):
+    start_time = parse_time_param(from_time, "from_time")
+    end_time = parse_time_param(to_time, "to_time")
+
+    db = get_scanpak_session()
+    try:
+        stmt = select(ParcelScan).where(text("1=1"))
+
+        if username:
+            stmt = stmt.where(ParcelScan.username.ilike(f"{username}%"))
+        if parcel_number:
+            stmt = stmt.where(ParcelScan.parcel_number.ilike(f"{parcel_number}%"))
+        if date:
+            try:
+                start = datetime.fromisoformat(date + " 00:00:00")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date: очікується формат YYYY-MM-DD")
+            end = start + timedelta(days=1)
+            stmt = stmt.where(and_(ParcelScan.scanned_at >= start, ParcelScan.scanned_at < end))
+
+        stmt = stmt.order_by(ParcelScan.scanned_at.desc())
+        rows = db.execute(stmt).scalars().all()
+
+        if start_time or end_time:
+            def within_time_range(ts: datetime) -> bool:
+                t = ts.time()
+                if start_time and t < start_time:
+                    return False
+                if end_time and t > end_time:
+                    return False
+                return True
+
+            rows = [r for r in rows if within_time_range(r.scanned_at)]
+
+        return rows
     finally:
         db.close()
 
