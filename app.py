@@ -1708,6 +1708,79 @@ def powerbi_data(
         db.close()
         scanpak_db.close()
 
+@app.delete("/admin/tracking/clear_all")
+def clear_all_tracking(_: dict = Depends(require_admin)):
+    db = get_session()
+    try:
+        db.execute(text("DELETE FROM tracking"))
+        db.commit()
+        return {"status": "tracking_deleted_all"}
+    finally:
+        db.close()
+
+
+@app.delete("/admin/tracking/clear_period")
+def clear_tracking_period(
+    date_from: str = Query(..., description="YYYY-MM-DD"),
+    date_to: str = Query(..., description="YYYY-MM-DD"),
+    _: dict = Depends(require_admin),
+):
+    db = get_session()
+    try:
+        try:
+            start = datetime.fromisoformat(date_from + " 00:00:00")
+            end = datetime.fromisoformat(date_to + " 23:59:59")
+        except:
+            raise HTTPException(status_code=400, detail="Неверный формат дат (нужно YYYY-MM-DD)")
+
+        db.execute(
+            text("""
+                DELETE FROM tracking 
+                WHERE datetime >= :start AND datetime <= :end
+            """),
+            {"start": start, "end": end}
+        )
+        db.commit()
+        return {"status": "tracking_deleted_period", "from": date_from, "to": date_to}
+    finally:
+        db.close()
+
+@app.delete("/admin/scanpak/history/clear_all")
+def clear_all_scanpak(_: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        db.execute(text("DELETE FROM parcel_scans"))
+        db.commit()
+        return {"status": "scanpak_deleted_all"}
+    finally:
+        db.close()
+
+
+@app.delete("/admin/scanpak/history/clear_period")
+def clear_scanpak_period(
+    date_from: str = Query(..., description="YYYY-MM-DD"),
+    date_to: str = Query(..., description="YYYY-MM-DD"),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        try:
+            start = datetime.fromisoformat(date_from + " 00:00:00")
+            end = datetime.fromisoformat(date_to + " 23:59:59")
+        except:
+            raise HTTPException(status_code=400, detail="Неверный формат дат (нужно YYYY-MM-DD)")
+
+        db.execute(
+            text("""
+                DELETE FROM parcel_scans
+                WHERE scanned_at >= :start AND scanned_at <= :end
+            """),
+            {"start": start, "end": end}
+        )
+        db.commit()
+        return {"status": "scanpak_deleted_period", "from": date_from, "to": date_to}
+    finally:
+        db.close()
 
 
 @app.delete("/purge_all")
