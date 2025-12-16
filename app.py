@@ -234,20 +234,20 @@ class ScanPakBase(DeclarativeBase):
 class Tracking(Base):
     __tablename__ = "tracking"
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
-    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False)
+    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, index=True)
     note: Mapped[Optional[str]] = mapped_column(SA_Text, nullable=True)
 
 
 class ErrorLog(Base):
     __tablename__ = "errors"
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
-    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False)
+    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, index=True)
     error_message: Mapped[str] = mapped_column(SA_Text, nullable=False)
 
 
@@ -327,10 +327,12 @@ class ParcelScan(ScanPakBase):
     __tablename__ = "parcel_scans"
 
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(SA_Integer, nullable=False)
-    username: Mapped[str] = mapped_column(String(255), nullable=False)
-    parcel_number: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    scanned_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
+    user_id: Mapped[int] = mapped_column(SA_Integer, nullable=False, index=True)
+    username: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    parcel_number: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    scanned_at: Mapped[datetime] = mapped_column(
+        SA_DateTime, nullable=False, default=datetime.utcnow, index=True
+    )
 
 
 with engine.begin() as conn:
@@ -509,13 +511,18 @@ def parse_time_param(value: Optional[str], name: str) -> Optional[time]:
 
 def check_duplicates(db, boxid: str, ttn: str):
     """Возвращает (note, exists_exact, exists_box, exists_ttn)."""
-    exists_exact = db.execute(
-        select(Tracking.id).where(and_(Tracking.boxid == boxid, Tracking.ttn == ttn))
-    ).first() is not None
+    exact_count, box_count, ttn_count = db.execute(
+        select(
+            func.count().filter(and_(Tracking.boxid == boxid, Tracking.ttn == ttn)),
+            func.count().filter(Tracking.boxid == boxid),
+            func.count().filter(Tracking.ttn == ttn),
+        )
+    ).one()
 
-    exists_box = db.execute(select(Tracking.id).where(Tracking.boxid == boxid)).first() is not None
 
-    exists_ttn = db.execute(select(Tracking.id).where(Tracking.ttn == ttn)).first() is not None
+    exists_exact = exact_count > 0
+    exists_box = box_count > 0
+    exists_ttn = ttn_count > 0
 
     if exists_exact:
         note = "Комбінація цього BoxID та цього ТТН вже є в базі"
