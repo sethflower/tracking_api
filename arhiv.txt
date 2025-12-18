@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Optional, List
 
 from dotenv import load_dotenv
@@ -38,15 +38,34 @@ else:
 engine = create_engine(
     SQLA_DB_URL,
     pool_pre_ping=True,
-    future=True
+    future=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
-app = FastAPI(title="TrackingApp API", version="1.2")
+# Отдельная БД для СканПак (по умолчанию использует основну, але дозволяє вказати окрему)
+SCANPAK_RAW_DB_URL = os.getenv("SCANPAK_DATABASE_URL", RAW_DB_URL)
+if SCANPAK_RAW_DB_URL.startswith("postgresql://"):
+    SCANPAK_SQLA_DB_URL = SCANPAK_RAW_DB_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+else:
+    SCANPAK_SQLA_DB_URL = SCANPAK_RAW_DB_URL
+
+scanpak_engine = create_engine(
+    SCANPAK_SQLA_DB_URL,
+    pool_pre_ping=True,
+    future=True,
+)
+ScanPakSessionLocal = sessionmaker(
+    bind=scanpak_engine, autoflush=False, autocommit=False, expire_on_commit=False
+)
+
+app = FastAPI(title="TrackingApp API", version="1.3")
 
 # ---------------------- Авторизация ----------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
+
+SCANPAK_SECRET_KEY = os.getenv("SCANPAK_SECRET_KEY", "scanpak-secret-key")
+SCANPAK_ALGORITHM = "HS256"
 
 # Значения уровней доступа используются в существующих фильтрах на фронтенде
 ROLE_LEVELS = {
@@ -55,12 +74,16 @@ ROLE_LEVELS = {
     "viewer": 2,
 }
 
+SCANPAK_ROLE_LEVELS = ROLE_LEVELS.copy()
+
 # Базовые пароли уровня доступа сохраняются для обратной совместимости и админ-входа
 ROLE_PASSWORDS = {
     "admin": "301993",
     "operator": "123123123",
     "viewer": "321321321",
 }
+
+SCANPAK_ROLE_PASSWORDS = ROLE_PASSWORDS.copy()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -87,8 +110,28 @@ def create_token(level: int, *, user_id: Optional[int] = None, surname: Optional
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def create_scanpak_token(level: int, *, user_id: Optional[int] = None, surname: Optional[str] = None) -> str:
+    payload = {
+        "level": level,
+        "app": "scanpak",
+        "exp": datetime.now() + timedelta(hours=12),
+    }
+    if user_id is not None:
+        payload["user_id"] = user_id
+    if surname is not None:
+        payload["surname"] = surname
+    return jwt.encode(payload, SCANPAK_SECRET_KEY, algorithm=SCANPAK_ALGORITHM)
+
+
 def get_role_for_password(password: str) -> Optional[str]:
     for role, stored_password in ROLE_PASSWORDS.items():
+        if stored_password == password:
+            return role
+    return None
+
+
+def get_scanpak_role_for_password(password: str) -> Optional[str]:
+    for role, stored_password in SCANPAK_ROLE_PASSWORDS.items():
         if stored_password == password:
             return role
     return None
@@ -99,6 +142,13 @@ def set_role_password_value(role: str, password: str) -> None:
     if current_password == password:
         return
     ROLE_PASSWORDS[role] = password
+
+
+def set_scanpak_role_password_value(role: str, password: str) -> None:
+    current_password = SCANPAK_ROLE_PASSWORDS.get(role)
+    if current_password == password:
+        return
+    SCANPAK_ROLE_PASSWORDS[role] = password
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
@@ -113,20 +163,47 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     except Exception:
         raise HTTPException(status_code=401, detail="Невірний або протермінований токен")
 
+
+def verify_scanpak_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    try:
+        payload = jwt.decode(credentials.credentials, SCANPAK_SECRET_KEY, algorithms=[SCANPAK_ALGORITHM])
+        level = payload.get("level")
+        if level is None or payload.get("app") != "scanpak":
+            raise HTTPException(status_code=401, detail="Невірний токен")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Термін дії токена минув")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Невірний або протермінований токен")
+
 POWERBI_KEY = os.getenv("POWERBI_KEY")
+
 
 def verify_powerbi_key(key: str):
     if key != POWERBI_KEY:
         raise HTTPException(status_code=401, detail="Invalid PowerBI key")
-        
+
+
 def require_admin(payload: dict = Depends(verify_token)) -> dict:
     if int(payload.get("level", -1)) != ROLE_LEVELS["admin"]:
         raise HTTPException(status_code=403, detail="Доступ тільки для адміністратора")
     return payload
 
 
+def require_scanpak_admin(payload: dict = Depends(verify_scanpak_token)) -> dict:
+    if int(payload.get("level", -1)) != SCANPAK_ROLE_LEVELS["admin"]:
+        raise HTTPException(status_code=403, detail="Доступ тільки для адміністратора")
+    return payload
+
+
 def require_write(payload: dict = Depends(verify_token)) -> dict:
     if int(payload.get("level", -1)) not in (ROLE_LEVELS["operator"], ROLE_LEVELS["admin"]):
+        raise HTTPException(status_code=403, detail="Недостатньо прав для цієї дії")
+    return payload
+
+
+def require_scanpak_write(payload: dict = Depends(verify_scanpak_token)) -> dict:
+    if int(payload.get("level", -1)) not in (SCANPAK_ROLE_LEVELS["operator"], SCANPAK_ROLE_LEVELS["admin"]):
         raise HTTPException(status_code=403, detail="Недостатньо прав для цієї дії")
     return payload
 
@@ -141,28 +218,36 @@ def require_read(payload: dict = Depends(verify_token)) -> dict:
     return payload
 
 
+def require_scanpak_read(payload: dict = Depends(verify_scanpak_token)) -> dict:
+    return payload
+
+
 # ---------------------- Модели БД ----------------------
 class Base(DeclarativeBase):
+    pass
+
+
+class ScanPakBase(DeclarativeBase):
     pass
 
 
 class Tracking(Base):
     __tablename__ = "tracking"
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
-    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False)
+    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, index=True)
     note: Mapped[Optional[str]] = mapped_column(SA_Text, nullable=True)
 
 
 class ErrorLog(Base):
     __tablename__ = "errors"
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
-    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False)
+    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, index=True)
     error_message: Mapped[str] = mapped_column(SA_Text, nullable=False)
 
 
@@ -203,7 +288,30 @@ class RegistrationRequest(Base):
     created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
 
 
-class ParcelUser(Base):
+class ScanPakUser(ScanPakBase):
+    __tablename__ = "scanpak_users"
+    __table_args__ = (UniqueConstraint("surname", name="uq_scanpak_users_surname"),)
+
+    id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
+    surname: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="operator")
+    is_active: Mapped[bool] = mapped_column(SA_Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ScanPakRegistrationRequest(ScanPakBase):
+    __tablename__ = "scanpak_registration_requests"
+    __table_args__ = (UniqueConstraint("surname", name="uq_scanpak_registration_requests_surname"),)
+
+    id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
+    surname: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ParcelUser(ScanPakBase):
     __tablename__ = "parcel_users"
     __table_args__ = (UniqueConstraint("username", name="uq_parcel_users_username"),)
 
@@ -212,20 +320,21 @@ class ParcelUser(Base):
     password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(SA_Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
-    )
+    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class ParcelScan(Base):
+class ParcelScan(ScanPakBase):
     __tablename__ = "parcel_scans"
 
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(SA_Integer, nullable=False)
-    username: Mapped[str] = mapped_column(String(255), nullable=False)
-    parcel_number: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    scanned_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
-    
+    user_id: Mapped[int] = mapped_column(SA_Integer, nullable=False, index=True)
+    username: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    parcel_number: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    scanned_at: Mapped[datetime] = mapped_column(
+        SA_DateTime, nullable=False, default=datetime.utcnow, index=True
+    )
+
+
 with engine.begin() as conn:
     Base.metadata.create_all(conn)
     conn.execute(text(
@@ -242,6 +351,9 @@ with engine.begin() as conn:
         ON CONFLICT (id) DO NOTHING
         """
     ))
+
+with scanpak_engine.begin() as conn:
+    ScanPakBase.metadata.create_all(conn)
 
 
 # ---------------------- Pydantic-схемы ----------------------
@@ -290,6 +402,7 @@ class AddErrorIn(BaseModel):
     ttn: str
     message: str
 
+
 class ParcelUserRegisterIn(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=6)
@@ -311,6 +424,16 @@ class ParcelScanIn(BaseModel):
 
 class ParcelScanOut(BaseModel):
     status: str
+    username: str
+    parcel_number: str
+    scanned_at: datetime
+
+
+class ParcelScanHistoryItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
     username: str
     parcel_number: str
     scanned_at: datetime
@@ -368,19 +491,38 @@ def get_session():
     return SessionLocal()
 
 
+def get_scanpak_session():
+    return ScanPakSessionLocal()
+
+
+def sanitize_digits(raw: str) -> str:
+    return "".join(ch for ch in raw if ch.isdigit())
+
+
+def parse_time_param(value: Optional[str], name: str) -> Optional[time]:
+    if value is None:
+        return None
+    try:
+        hour, minute = map(int, value.split(":"))
+        return time(hour, minute)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{name}: очікується формат HH:MM")
+
+
 def check_duplicates(db, boxid: str, ttn: str):
     """Возвращает (note, exists_exact, exists_box, exists_ttn)."""
-    exists_exact = db.execute(
-        select(Tracking.id).where(and_(Tracking.boxid == boxid, Tracking.ttn == ttn))
-    ).first() is not None
+    exact_count, box_count, ttn_count = db.execute(
+        select(
+            func.count().filter(and_(Tracking.boxid == boxid, Tracking.ttn == ttn)),
+            func.count().filter(Tracking.boxid == boxid),
+            func.count().filter(Tracking.ttn == ttn),
+        )
+    ).one()
 
-    exists_box = db.execute(
-        select(Tracking.id).where(Tracking.boxid == boxid)
-    ).first() is not None
 
-    exists_ttn = db.execute(
-        select(Tracking.id).where(Tracking.ttn == ttn)
-    ).first() is not None
+    exists_exact = exact_count > 0
+    exists_box = box_count > 0
+    exists_ttn = ttn_count > 0
 
     if exists_exact:
         note = "Комбінація цього BoxID та цього ТТН вже є в базі"
@@ -399,6 +541,11 @@ def ensure_role(role: str) -> str:
         raise HTTPException(status_code=400, detail="Невідомий рівень доступу")
     return role
 
+def ensure_scanpak_role(role: str) -> str:
+    if role not in SCANPAK_ROLE_LEVELS:
+        raise HTTPException(status_code=400, detail="Невідомий рівень доступу")
+    return role
+
 def create_parcel_token(user_id: int, username: str) -> str:
     payload = {
         "scope": "parcel",
@@ -406,12 +553,12 @@ def create_parcel_token(user_id: int, username: str) -> str:
         "username": username,
         "exp": datetime.now() + timedelta(hours=12),
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(payload, SCANPAK_SECRET_KEY, algorithm=SCANPAK_ALGORITHM)
 
 
 def verify_parcel_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(credentials.credentials, SCANPAK_SECRET_KEY, algorithms=[SCANPAK_ALGORITHM])
         if payload.get("scope") != "parcel" or "parcel_user_id" not in payload:
             raise HTTPException(status_code=401, detail="Невірний токен для додатку посилок")
         return payload
@@ -447,7 +594,6 @@ def login(
     ),
 ):
     if payload is not None:
-        # Приоритет у тела запроса, щоб працювало з оновленим фронтендом
         password = payload.password
         surname = payload.surname
 
@@ -456,7 +602,6 @@ def login(
 
     password = password.strip()
 
-    # Вход по персональным данным
     if surname:
         surname = surname.strip()
         db = get_session()
@@ -474,7 +619,6 @@ def login(
         finally:
             db.close()
 
-    # Вход по прежним паролям (администратор и вспомогательные доступы)
     role = get_role_for_password(password)
     if role is None:
         raise HTTPException(status_code=401, detail="Невірний пароль")
@@ -510,17 +654,366 @@ def admin_login(
     token = create_token(level)
     return LoginResponse(token=token, access_level=level, role="admin")
 
+
+@app.post("/scanpak/login", response_model=LoginResponse)
+def scanpak_login(
+    payload: Optional[LoginRequest] = Body(
+        default=None,
+        description="Дані для входу в СканПак. Якщо не передані, використовуються query-параметри",
+    ),
+    password: Optional[str] = Query(default=None, description="Пароль або пароль користувача"),
+    surname: Optional[str] = Query(default=None, description="Фамілія користувача для входу по особистому паролю"),
+):
+    if payload is not None:
+        password = payload.password
+        surname = payload.surname
+
+    if not password:
+        raise HTTPException(status_code=400, detail="Пароль обов'язковий")
+
+    password = password.strip()
+
+    if surname:
+        surname = surname.strip()
+        db = get_scanpak_session()
+        try:
+            stmt = select(ScanPakUser).where(ScanPakUser.surname.ilike(surname))
+            user = db.execute(stmt).scalar_one_or_none()
+            if not user or not user.is_active:
+                raise HTTPException(status_code=401, detail="Користувач не активний або не існує")
+            if not verify_password(password, user.password_hash):
+                raise HTTPException(status_code=401, detail="Невірний пароль")
+            role = ensure_scanpak_role(user.role)
+            level = SCANPAK_ROLE_LEVELS[role]
+            token = create_scanpak_token(level, user_id=user.id, surname=user.surname)
+            return LoginResponse(token=token, access_level=level, role=role, surname=user.surname)
+        finally:
+            db.close()
+
+    role = get_scanpak_role_for_password(password)
+    if role is None:
+        raise HTTPException(status_code=401, detail="Невірний пароль")
+    level = SCANPAK_ROLE_LEVELS[role]
+    token = create_scanpak_token(level)
+    return LoginResponse(token=token, access_level=level, role=role)
+
+
+@app.post("/scanpak/admin_login", response_model=LoginResponse)
+def scanpak_admin_login(
+    payload: Optional[LoginRequest] = Body(
+        default=None,
+        description="Пароль адміністратора СканПак. Якщо не переданий, використовується query-параметр",
+    ),
+    password: Optional[str] = Query(
+        default=None,
+        description="Пароль адміністратора СканПак для швидкого входу",
+    ),
+):
+    if payload is not None:
+        password = payload.password
+
+    if not password:
+        raise HTTPException(status_code=400, detail="Пароль адміністратора обов'язковий")
+
+    password = password.strip()
+
+    role = get_scanpak_role_for_password(password)
+    if role != "admin":
+        raise HTTPException(status_code=401, detail="Невірний пароль адміністратора")
+
+    level = SCANPAK_ROLE_LEVELS["admin"]
+    token = create_scanpak_token(level)
+    return LoginResponse(token=token, access_level=level, role="admin")
+
+
+@app.post("/scanpak/register", response_model=RegistrationRequestOut)
+def scanpak_register(payload: RegistrationIn):
+    db = get_scanpak_session()
+    try:
+        normalized_surname = payload.surname.strip()
+        if not normalized_surname:
+            raise HTTPException(status_code=400, detail="Фамилия не може бути порожньою")
+
+        existing_user = db.execute(select(ScanPakUser.id).where(ScanPakUser.surname.ilike(normalized_surname))).first()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="Користувач з такою фамілією вже існує")
+
+        existing_request = db.execute(select(ScanPakRegistrationRequest.id).where(ScanPakRegistrationRequest.surname.ilike(normalized_surname))).first()
+        if existing_request:
+            raise HTTPException(status_code=409, detail="Заявка з такою фамілією вже існує")
+
+        req = ScanPakRegistrationRequest(
+            surname=normalized_surname,
+            password_hash=hash_password(payload.password),
+        )
+        db.add(req)
+        db.commit()
+        db.refresh(req)
+        return req
+    finally:
+        db.close()
+
+
+@app.get("/scanpak/admin/registration_requests", response_model=List[RegistrationRequestOut])
+def scanpak_list_registration_requests(_: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        stmt = select(ScanPakRegistrationRequest).order_by(ScanPakRegistrationRequest.created_at.asc())
+        return db.execute(stmt).scalars().all()
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/registration_requests/{request_id}/approve", response_model=UserOut)
+def scanpak_approve_registration(
+    payload: ApproveRegistrationIn,
+    request_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    role = ensure_scanpak_role(payload.role)
+    db = get_scanpak_session()
+    try:
+        req = db.get(ScanPakRegistrationRequest, request_id)
+        if not req:
+            raise HTTPException(status_code=404, detail="Заявку не знайдено")
+
+        user = ScanPakUser(
+            surname=req.surname,
+            password_hash=req.password_hash,
+            role=role,
+            is_active=True,
+        )
+        db.add(user)
+        db.delete(req)
+        db.commit()
+        db.refresh(user)
+        return user
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/registration_requests/{request_id}/reject")
+def scanpak_reject_registration(request_id: int = Path(..., gt=0), _: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        req = db.get(ScanPakRegistrationRequest, request_id)
+        if not req:
+            raise HTTPException(status_code=404, detail="Заявку не знайдено")
+        db.delete(req)
+        db.commit()
+        return {"status": "rejected", "id": request_id}
+    finally:
+        db.close()
+
+
+@app.get("/scanpak/admin/users", response_model=List[UserOut])
+def scanpak_list_users(_: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        stmt = select(ScanPakUser).order_by(ScanPakUser.created_at.asc())
+        return db.execute(stmt).scalars().all()
+    finally:
+        db.close()
+
+
+@app.patch("/scanpak/admin/users/{user_id}", response_model=UserOut)
+def scanpak_update_user(
+    payload: UpdateUserIn,
+    user_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    if payload.role is None and payload.is_active is None:
+        raise HTTPException(status_code=400, detail="Нічого оновлювати")
+
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+
+        if payload.role is not None:
+            user.role = ensure_scanpak_role(payload.role)
+        if payload.is_active is not None:
+            user.is_active = payload.is_active
+
+        db.commit()
+        db.refresh(user)
+        return user
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/reset_password")
+def scanpak_reset_user_password(
+    new_password: str = Query(..., min_length=6),
+    user_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        user.password_hash = hash_password(new_password)
+        db.commit()
+        return {"status": "password_reset", "id": user_id}
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/deactivate")
+def scanpak_deactivate_user(user_id: int = Path(..., gt=0), _: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        user.is_active = False
+        db.commit()
+        return {"status": "deactivated", "id": user_id}
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/activate")
+def scanpak_activate_user(user_id: int = Path(..., gt=0), _: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        user.is_active = True
+        db.commit()
+        return {"status": "activated", "id": user_id}
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users")
+def scanpak_create_user(
+    payload: ApproveRegistrationIn,
+    surname: str = Query(..., min_length=1),
+    password: str = Query(..., min_length=6),
+    _: dict = Depends(require_scanpak_admin),
+):
+    role = ensure_scanpak_role(payload.role)
+    db = get_scanpak_session()
+    try:
+        normalized_surname = surname.strip()
+        if not normalized_surname:
+            raise HTTPException(status_code=400, detail="Фамилия не може бути порожньою")
+
+        existing_user = db.execute(select(ScanPakUser.id).where(ScanPakUser.surname.ilike(normalized_surname))).first()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="Користувач з такою фамілією вже існує")
+
+        user = ScanPakUser(
+            surname=normalized_surname,
+            password_hash=hash_password(password),
+            role=role,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/change_role")
+def scanpak_change_user_role(
+    payload: ApproveRegistrationIn,
+    user_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        user.role = ensure_scanpak_role(payload.role)
+        db.commit()
+        return {"status": "role_updated", "id": user_id, "role": user.role}
+    finally:
+        db.close()
+
+
+@app.delete("/scanpak/admin/users/{user_id}")
+def scanpak_delete_user(user_id: int = Path(..., gt=0), _: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        db.delete(user)
+        db.commit()
+        return {"status": "deleted", "id": user_id}
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/set_password")
+def scanpak_set_user_password(
+    new_password: str = Query(..., min_length=6),
+    user_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        user.password_hash = hash_password(new_password)
+        db.commit()
+        return {"status": "password_updated", "id": user_id}
+    finally:
+        db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/set_activity")
+def scanpak_set_user_activity(
+    is_active: bool = Query(...),
+    user_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        user.is_active = is_active
+        db.commit()
+        return {"status": "activity_updated", "id": user_id, "is_active": is_active}
+    finally:
+        db.close()
+
+
+@app.get("/scanpak/admin/role-passwords")
+def get_scanpak_role_passwords(_: dict = Depends(require_scanpak_admin)):
+    return dict(SCANPAK_ROLE_PASSWORDS)
+
+
+@app.post("/scanpak/admin/role-passwords/{role}")
+def set_scanpak_role_password(role: str, payload: RolePasswordSetIn, _: dict = Depends(require_scanpak_admin)):
+    role = ensure_scanpak_role(role)
+    new_password = payload.password.strip()
+    if not new_password:
+        raise HTTPException(status_code=400, detail="Пароль не може бути порожнім")
+    set_scanpak_role_password_value(role, new_password)
+    return {"status": "updated", "role": role}
+
+
+@app.post("/scanpak/parcel/register", response_model=ParcelAuthResponse)
 @app.post("/parcel/register", response_model=ParcelAuthResponse)
 def parcel_register(payload: ParcelUserRegisterIn):
-    db = get_session()
+    db = get_scanpak_session()
     try:
         username = payload.username.strip()
         if not username:
             raise HTTPException(status_code=400, detail="Ім'я користувача не може бути порожнім")
 
-        existing_user = db.execute(
-            select(ParcelUser.id).where(ParcelUser.username.ilike(username))
-        ).first()
+        existing_user = db.execute(select(ParcelUser.id).where(ParcelUser.username.ilike(username))).first()
         if existing_user:
             raise HTTPException(status_code=409, detail="Користувач з таким ім'ям вже існує")
 
@@ -535,9 +1028,10 @@ def parcel_register(payload: ParcelUserRegisterIn):
         db.close()
 
 
+@app.post("/scanpak/parcel/login", response_model=ParcelAuthResponse)
 @app.post("/parcel/login", response_model=ParcelAuthResponse)
 def parcel_login(payload: ParcelUserLoginIn):
-    db = get_session()
+    db = get_scanpak_session()
     try:
         username = payload.username.strip()
         if not username:
@@ -556,13 +1050,14 @@ def parcel_login(payload: ParcelUserLoginIn):
         db.close()
 
 
+@app.post("/scanpak/parcel/scans", response_model=ParcelScanOut)
 @app.post("/parcel/scans", response_model=ParcelScanOut)
 def create_parcel_scan(payload: ParcelScanIn, auth: dict = Depends(require_parcel_user)):
-    parcel_number = payload.parcel_number.strip()
+    parcel_number = sanitize_digits(payload.parcel_number)
     if not parcel_number:
         raise HTTPException(status_code=400, detail="Номер посилки не може бути порожнім")
 
-    db = get_session()
+    db = get_scanpak_session()
     try:
         scan = ParcelScan(
             user_id=int(auth["parcel_user_id"]),
@@ -583,6 +1078,84 @@ def create_parcel_scan(payload: ParcelScanIn, auth: dict = Depends(require_parce
         db.close()
 
 
+@app.post("/scanpak/scans", response_model=ParcelScanOut)
+def create_scanpak_scan(payload: ParcelScanIn, auth: dict = Depends(require_scanpak_write)):
+    parcel_number = sanitize_digits(payload.parcel_number)
+    if not parcel_number:
+        raise HTTPException(status_code=400, detail="Номер посилки не може бути порожнім")
+
+    user_id = auth.get("user_id")
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="У токені відсутній ідентифікатор користувача")
+
+    username = auth.get("surname", "") or "невідомий користувач"
+
+    db = get_scanpak_session()
+    try:
+        scan = ParcelScan(
+            user_id=int(user_id),
+            username=username,
+            parcel_number=parcel_number,
+            scanned_at=datetime.utcnow(),
+        )
+        db.add(scan)
+        db.commit()
+        db.refresh(scan)
+        return ParcelScanOut(
+            status="recorded",
+            username=scan.username,
+            parcel_number=scan.parcel_number,
+            scanned_at=scan.scanned_at,
+        )
+    finally:
+        db.close()
+
+
+@app.get("/scanpak/history", response_model=List[ParcelScanHistoryItem])
+def get_scanpak_history(
+    username: Optional[str] = Query(default=None),
+    parcel_number: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None, description="Формат YYYY-MM-DD"),
+    from_time: Optional[str] = Query(default=None, description="Формат HH:MM"),
+    to_time: Optional[str] = Query(default=None, description="Формат HH:MM"),
+    _: dict = Depends(require_scanpak_read),
+):
+    start_time = parse_time_param(from_time, "from_time")
+    end_time = parse_time_param(to_time, "to_time")
+
+    db = get_scanpak_session()
+    try:
+        stmt = select(ParcelScan).where(text("1=1"))
+
+        if username:
+            stmt = stmt.where(ParcelScan.username.ilike(f"{username}%"))
+        if parcel_number:
+            stmt = stmt.where(ParcelScan.parcel_number.ilike(f"{parcel_number}%"))
+        if date:
+            try:
+                start = datetime.fromisoformat(date + " 00:00:00")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date: очікується формат YYYY-MM-DD")
+            end = start + timedelta(days=1)
+            stmt = stmt.where(and_(ParcelScan.scanned_at >= start, ParcelScan.scanned_at < end))
+
+        stmt = stmt.order_by(ParcelScan.scanned_at.desc())
+        rows = db.execute(stmt).scalars().all()
+
+        if start_time or end_time:
+            def within_time_range(ts: datetime) -> bool:
+                t = ts.time()
+                if start_time and t < start_time:
+                    return False
+                if end_time and t > end_time:
+                    return False
+                return True
+
+            rows = [r for r in rows if within_time_range(r.scanned_at)]
+
+        return rows
+    finally:
+        db.close()
 
 
 @app.post("/register", response_model=RegistrationRequestOut)
@@ -597,9 +1170,7 @@ def register(payload: RegistrationIn):
         if existing_user:
             raise HTTPException(status_code=409, detail="Користувач з такою фамілією вже існує")
 
-        existing_request = db.execute(
-            select(RegistrationRequest.id).where(RegistrationRequest.surname.ilike(normalized_surname))
-        ).first()
+        existing_request = db.execute(select(RegistrationRequest.id).where(RegistrationRequest.surname.ilike(normalized_surname))).first()
         if existing_request:
             raise HTTPException(status_code=409, detail="Заявка з такою фамілією вже існує")
 
@@ -856,11 +1427,7 @@ def get_role_passwords(_: dict = Depends(require_admin)):
 
 
 @app.post("/admin/role-passwords/{role}")
-def set_role_password(
-    role: str,
-    payload: RolePasswordSetIn,
-    _: dict = Depends(require_admin),
-):
+def set_role_password(role: str, payload: RolePasswordSetIn, _: dict = Depends(require_admin)):
     role = ensure_role(role)
     new_password = payload.password.strip()
     if not new_password:
@@ -875,7 +1442,6 @@ def add_record(payload: AddRecordIn, _: dict = Depends(require_write)):
     try:
         note, exists_exact, exists_box, exists_ttn = check_duplicates(db, payload.boxid, payload.ttn)
 
-        # Всегда пишем в историю
         rec = Tracking(
             user_name=payload.user_name,
             boxid=payload.boxid,
@@ -885,7 +1451,6 @@ def add_record(payload: AddRecordIn, _: dict = Depends(require_write)):
         )
         db.add(rec)
 
-        # Если это не точный дубликат, но есть совпадение по boxid или ttn — создаем запись ошибки
         if not exists_exact and (exists_box or exists_ttn):
             if exists_box and exists_ttn:
                 err_msg = "BoxID та ТТН вже використовуються в інших поєднаннях"
@@ -1049,19 +1614,68 @@ def set_help(payload: HelpSetIn, _: dict = Depends(require_admin)):
 
 
 @app.get("/powerbi/data")
-def powerbi_data(key: str = Query(...)):
+def powerbi_data(
+    key: str = Query(...),
+    username: Optional[str] = Query(default=None),
+    parcel_number: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
+    from_time: Optional[str] = Query(default=None),
+    to_time: Optional[str] = Query(default=None),
+):
     verify_powerbi_key(key)
 
     db = get_session()
+    scanpak_db = get_scanpak_session()
+
     try:
+        # ------- TRACKING -------
         tracking = db.execute(
             select(Tracking).order_by(Tracking.datetime.desc())
         ).scalars().all()
 
+        # ------- ERRORS -------
         errors = db.execute(
             select(ErrorLog).order_by(ErrorLog.datetime.desc())
         ).scalars().all()
 
+        # ------- SCANPAK HISTORY (как /scanpak/history) -------
+        stmt = select(ParcelScan).where(text("1=1"))
+
+        if username:
+            stmt = stmt.where(ParcelScan.username.ilike(f"{username}%"))
+
+        if parcel_number:
+            stmt = stmt.where(ParcelScan.parcel_number.ilike(f"{parcel_number}%"))
+
+        if date:
+            try:
+                start = datetime.fromisoformat(date + " 00:00:00")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date: очікується формат YYYY-MM-DD")
+            end = start + timedelta(days=1)
+            stmt = stmt.where(
+                and_(ParcelScan.scanned_at >= start, ParcelScan.scanned_at < end)
+            )
+
+        stmt = stmt.order_by(ParcelScan.scanned_at.desc())
+        history_rows = scanpak_db.execute(stmt).scalars().all()
+
+        # фильтр по времени
+        start_time = parse_time_param(from_time, "from_time")
+        end_time = parse_time_param(to_time, "to_time")
+
+        if start_time or end_time:
+            def within(ts: datetime):
+                t = ts.time()
+                if start_time and t < start_time:
+                    return False
+                if end_time and t > end_time:
+                    return False
+                return True
+
+            history_rows = [r for r in history_rows if within(r.scanned_at)]
+
+        # ------- JSON -------
         return {
             "tracking": [
                 {
@@ -1070,7 +1684,7 @@ def powerbi_data(key: str = Query(...)):
                     "boxid": r.boxid,
                     "ttn": r.ttn,
                     "datetime": r.datetime.isoformat(),
-                    "note": r.note or ""
+                    "note": r.note or "",
                 }
                 for r in tracking
             ],
@@ -1081,20 +1695,103 @@ def powerbi_data(key: str = Query(...)):
                     "boxid": e.boxid,
                     "ttn": e.ttn,
                     "datetime": e.datetime.isoformat(),
-                    "error": e.error_message
+                    "error": e.error_message,
                 }
                 for e in errors
-            ]
+            ],
+            "scanpak_history": [
+                {
+                    "id": s.id,
+                    "user_id": s.user_id,
+                    "username": s.username,
+                    "parcel_number": s.parcel_number,
+                    "scanned_at": s.scanned_at.isoformat(),
+                }
+                for s in history_rows
+            ],
         }
+
+    finally:
+        db.close()
+        scanpak_db.close()
+
+@app.delete("/admin/tracking/clear_all")
+def clear_all_tracking(_: dict = Depends(require_admin)):
+    db = get_session()
+    try:
+        db.execute(text("DELETE FROM tracking"))
+        db.commit()
+        return {"status": "tracking_deleted_all"}
+    finally:
+        db.close()
+
+
+@app.delete("/admin/tracking/clear_period")
+def clear_tracking_period(
+    date_from: str = Query(..., description="YYYY-MM-DD"),
+    date_to: str = Query(..., description="YYYY-MM-DD"),
+    _: dict = Depends(require_admin),
+):
+    db = get_session()
+    try:
+        try:
+            start = datetime.fromisoformat(date_from + " 00:00:00")
+            end = datetime.fromisoformat(date_to + " 23:59:59")
+        except:
+            raise HTTPException(status_code=400, detail="Неверный формат дат (нужно YYYY-MM-DD)")
+
+        db.execute(
+            text("""
+                DELETE FROM tracking 
+                WHERE datetime >= :start AND datetime <= :end
+            """),
+            {"start": start, "end": end}
+        )
+        db.commit()
+        return {"status": "tracking_deleted_period", "from": date_from, "to": date_to}
+    finally:
+        db.close()
+
+@app.delete("/admin/scanpak/history/clear_all")
+def clear_all_scanpak(_: dict = Depends(require_scanpak_admin)):
+    db = get_scanpak_session()
+    try:
+        db.execute(text("DELETE FROM parcel_scans"))
+        db.commit()
+        return {"status": "scanpak_deleted_all"}
+    finally:
+        db.close()
+
+
+@app.delete("/admin/scanpak/history/clear_period")
+def clear_scanpak_period(
+    date_from: str = Query(..., description="YYYY-MM-DD"),
+    date_to: str = Query(..., description="YYYY-MM-DD"),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        try:
+            start = datetime.fromisoformat(date_from + " 00:00:00")
+            end = datetime.fromisoformat(date_to + " 23:59:59")
+        except:
+            raise HTTPException(status_code=400, detail="Неверный формат дат (нужно YYYY-MM-DD)")
+
+        db.execute(
+            text("""
+                DELETE FROM parcel_scans
+                WHERE scanned_at >= :start AND scanned_at <= :end
+            """),
+            {"start": start, "end": end}
+        )
+        db.commit()
+        return {"status": "scanpak_deleted_period", "from": date_from, "to": date_to}
     finally:
         db.close()
 
 
 @app.delete("/purge_all")
 def purge_all(_: dict = Depends(require_admin)):
-    """
-    Полная очистка всех данных (доступ только админу)
-    """
     db = get_session()
     try:
         db.execute(text("TRUNCATE TABLE tracking, errors RESTART IDENTITY CASCADE"))
