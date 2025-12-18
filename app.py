@@ -14,6 +14,7 @@ from sqlalchemy import (
     select,
     func,
     and_,
+    delete,
     text,
     String,
     UniqueConstraint,
@@ -59,6 +60,8 @@ ScanPakSessionLocal = sessionmaker(
 )
 
 app = FastAPI(title="TrackingApp API", version="1.3")
+
+HISTORY_RETENTION_DAYS = 2
 
 # ---------------------- Авторизация ----------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -234,6 +237,17 @@ class ScanPakBase(DeclarativeBase):
 class Tracking(Base):
     __tablename__ = "tracking"
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
+    user_name: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    boxid: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    ttn: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
+    datetime: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, index=True)
+    note: Mapped[Optional[str]] = mapped_column(SA_Text, nullable=True)
+
+class TrackingArchive(Base):
+    __tablename__ = "tracking_archive"
+
+    id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
+    tracking_id: Mapped[int] = mapped_column(SA_Integer, nullable=False, unique=True, index=True)
     user_name: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
     boxid: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
     ttn: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
@@ -535,7 +549,47 @@ def check_duplicates(db, boxid: str, ttn: str):
 
     return note, exists_exact, exists_box, exists_ttn
 
+def archive_tracking_records(db, records: List[Tracking]):
+    if not records:
+        return
 
+    record_ids = [r.id for r in records]
+    existing_ids = set(
+        db.execute(
+            select(TrackingArchive.tracking_id).where(TrackingArchive.tracking_id.in_(record_ids))
+        ).scalars()
+    )
+
+    for rec in records:
+        if rec.id in existing_ids:
+            continue
+        db.add(
+            TrackingArchive(
+                tracking_id=rec.id,
+                user_name=rec.user_name,
+                boxid=rec.boxid,
+                ttn=rec.ttn,
+                datetime=rec.datetime,
+                note=rec.note,
+            )
+        )
+
+
+def purge_old_tracking_records(db, *, retention_days: int = HISTORY_RETENTION_DAYS, commit: bool = True) -> int:
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    old_records = db.execute(select(Tracking).where(Tracking.datetime < cutoff)).scalars().all()
+
+    if not old_records:
+        return 0
+
+    archive_tracking_records(db, old_records)
+    db.execute(delete(Tracking).where(Tracking.id.in_([r.id for r in old_records])))
+
+    if commit:
+        db.commit()
+
+    return len(old_records)
+    
 def ensure_role(role: str) -> str:
     if role not in ROLE_LEVELS:
         raise HTTPException(status_code=400, detail="Невідомий рівень доступу")
@@ -1440,6 +1494,7 @@ def set_role_password(role: str, payload: RolePasswordSetIn, _: dict = Depends(r
 def add_record(payload: AddRecordIn, _: dict = Depends(require_write)):
     db = get_session()
     try:
+        purge_old_tracking_records(db, commit=False)
         note, exists_exact, exists_box, exists_ttn = check_duplicates(db, payload.boxid, payload.ttn)
 
         rec = Tracking(
@@ -1450,6 +1505,8 @@ def add_record(payload: AddRecordIn, _: dict = Depends(require_write)):
             note=note
         )
         db.add(rec)
+        db.flush()
+        archive_tracking_records(db, [rec])
 
         if not exists_exact and (exists_box or exists_ttn):
             if exists_box and exists_ttn:
@@ -1485,6 +1542,7 @@ def get_history(
 ):
     db = get_session()
     try:
+        purge_old_tracking_records(db)
         stmt = select(Tracking).where(text("1=1"))
         if user_name:
             stmt = stmt.where(Tracking.user_name.ilike(f"{user_name}%"))
@@ -1630,7 +1688,7 @@ def powerbi_data(
     try:
         # ------- TRACKING -------
         tracking = db.execute(
-            select(Tracking).order_by(Tracking.datetime.desc())
+            select(TrackingArchive).order_by(TrackingArchive.datetime.desc())
         ).scalars().all()
 
         # ------- ERRORS -------
