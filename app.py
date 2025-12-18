@@ -61,7 +61,7 @@ ScanPakSessionLocal = sessionmaker(
 
 app = FastAPI(title="TrackingApp API", version="1.3")
 
-HISTORY_RETENTION_DAYS = 2
+HISTORY_RETENTION_HOURS = 10
 
 # ---------------------- Авторизация ----------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -575,8 +575,8 @@ def archive_tracking_records(db, records: List[Tracking]):
         )
 
 
-def purge_old_tracking_records(db, *, retention_days: int = HISTORY_RETENTION_DAYS, commit: bool = True) -> int:
-    cutoff = datetime.now() - timedelta(days=retention_days)
+def purge_old_tracking_records(db, *, retention_hours: int = HISTORY_RETENTION_HOURS, commit: bool = True) -> int:
+    cutoff = datetime.now() - timedelta(hours=retention_hours)
     old_records = db.execute(select(Tracking).where(Tracking.datetime < cutoff)).scalars().all()
 
     if not old_records:
@@ -589,6 +589,8 @@ def purge_old_tracking_records(db, *, retention_days: int = HISTORY_RETENTION_DA
         db.commit()
 
     return len(old_records)
+
+
     
 def ensure_role(role: str) -> str:
     if role not in ROLE_LEVELS:
