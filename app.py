@@ -16,6 +16,7 @@ from sqlalchemy import (
     and_,
     delete,
     text,
+    update,
     String,
     UniqueConstraint,
 )
@@ -479,6 +480,9 @@ class RegistrationRequestOut(BaseModel):
 
 class ApproveRegistrationIn(BaseModel):
     role: str = Field(..., pattern="^(admin|operator|viewer)$")
+
+class ChangeSurnameIn(BaseModel):
+    surname: str = Field(..., min_length=1)
 
 
 class UpdateUserIn(BaseModel):
@@ -993,6 +997,43 @@ def scanpak_change_user_role(
         return {"status": "role_updated", "id": user_id, "role": user.role}
     finally:
         db.close()
+
+
+@app.post("/scanpak/admin/users/{user_id}/change_surname", response_model=UserOut)
+def scanpak_change_user_surname(
+    payload: ChangeSurnameIn,
+    user_id: int = Path(..., gt=0),
+    _: dict = Depends(require_scanpak_admin),
+):
+    db = get_scanpak_session()
+    try:
+        new_surname = payload.surname.strip()
+        if not new_surname:
+            raise HTTPException(status_code=400, detail="Фамилия не може бути порожньою")
+
+        user = db.get(ScanPakUser, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Користувача не знайдено")
+
+        existing_user = db.execute(
+            select(ScanPakUser.id).where(
+                ScanPakUser.surname.ilike(new_surname),
+                ScanPakUser.id != user_id,
+            )
+        ).first()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="Користувач з такою фамілією вже існує")
+
+        user.surname = new_surname
+        db.execute(
+            update(ParcelScan).where(ParcelScan.user_id == user_id).values(username=new_surname)
+        )
+        db.commit()
+        db.refresh(user)
+        return user
+    finally:
+        db.close()
+
 
 
 @app.delete("/scanpak/admin/users/{user_id}")
