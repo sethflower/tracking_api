@@ -62,6 +62,9 @@ ScanPakSessionLocal = sessionmaker(
 
 app = FastAPI(title="TrackingApp API", version="1.3")
 
+def now_local() -> datetime:
+    return datetime.now()
+
 HISTORY_RETENTION_HOURS = 10
 
 # ---------------------- Авторизация ----------------------
@@ -105,7 +108,7 @@ def verify_password(raw_password: str, password_hash: str) -> bool:
 def create_token(level: int, *, user_id: Optional[int] = None, surname: Optional[str] = None) -> str:
     payload = {
         "level": level,
-        "exp": datetime.now() + timedelta(hours=12),
+        "exp": now_local() + timedelta(hours=12),
     }
     if user_id is not None:
         payload["user_id"] = user_id
@@ -118,7 +121,7 @@ def create_scanpak_token(level: int, *, user_id: Optional[int] = None, surname: 
     payload = {
         "level": level,
         "app": "scanpak",
-        "exp": datetime.now() + timedelta(hours=12),
+        "exp": now_local() + timedelta(hours=12),
     }
     if user_id is not None:
         payload["user_id"] = user_id
@@ -289,8 +292,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="operator")
     is_active: Mapped[bool] = mapped_column(SA_Boolean, nullable=False, default=False)
-    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local)
+    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local, onupdate=now_local)
 
 
 class RegistrationRequest(Base):
@@ -300,8 +303,7 @@ class RegistrationRequest(Base):
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
     surname: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
-
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local)
 
 class ScanPakUser(ScanPakBase):
     __tablename__ = "scanpak_users"
@@ -312,8 +314,8 @@ class ScanPakUser(ScanPakBase):
     password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="operator")
     is_active: Mapped[bool] = mapped_column(SA_Boolean, nullable=False, default=False)
-    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local)
+    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local, onupdate=now_local)
 
 
 class ScanPakRegistrationRequest(ScanPakBase):
@@ -323,7 +325,7 @@ class ScanPakRegistrationRequest(ScanPakBase):
     id: Mapped[int] = mapped_column(SA_Integer, primary_key=True, autoincrement=True)
     surname: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local)
 
 
 class ParcelUser(ScanPakBase):
@@ -334,8 +336,8 @@ class ParcelUser(ScanPakBase):
     username: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(SA_Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(SA_Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local)
+    updated_at: Mapped[datetime] = mapped_column(SA_DateTime, nullable=False, default=now_local, onupdate=now_local)
 
 
 class ParcelScan(ScanPakBase):
@@ -346,7 +348,7 @@ class ParcelScan(ScanPakBase):
     username: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     parcel_number: Mapped[str] = mapped_column(SA_Text, nullable=False, index=True)
     scanned_at: Mapped[datetime] = mapped_column(
-        SA_DateTime, nullable=False, default=datetime.utcnow, index=True
+        SA_DateTime, nullable=False, default=now_local, index=True
     )
 
 
@@ -580,7 +582,7 @@ def archive_tracking_records(db, records: List[Tracking]):
 
 
 def purge_old_tracking_records(db, *, retention_hours: int = HISTORY_RETENTION_HOURS, commit: bool = True) -> int:
-    cutoff = datetime.now() - timedelta(hours=retention_hours)
+    cutoff = now_local() - timedelta(hours=retention_hours)
     old_records = db.execute(select(Tracking).where(Tracking.datetime < cutoff)).scalars().all()
 
     if not old_records:
@@ -611,7 +613,7 @@ def create_parcel_token(user_id: int, username: str) -> str:
         "scope": "parcel",
         "parcel_user_id": user_id,
         "username": username,
-        "exp": datetime.now() + timedelta(hours=12),
+        "exp": now_local() + timedelta(hours=12),
     }
     return jwt.encode(payload, SCANPAK_SECRET_KEY, algorithm=SCANPAK_ALGORITHM)
 
@@ -1160,7 +1162,7 @@ def create_parcel_scan(payload: ParcelScanIn, auth: dict = Depends(require_parce
             user_id=int(auth["parcel_user_id"]),
             username=auth.get("username", ""),
             parcel_number=parcel_number,
-            scanned_at=datetime.utcnow(),
+            scanned_at=now_local(),
         )
         db.add(scan)
         db.commit()
@@ -1193,7 +1195,7 @@ def create_scanpak_scan(payload: ParcelScanIn, auth: dict = Depends(require_scan
             user_id=int(user_id),
             username=username,
             parcel_number=parcel_number,
-            scanned_at=datetime.utcnow(),
+            scanned_at=now_local(),
         )
         db.add(scan)
         db.commit()
@@ -1544,7 +1546,7 @@ def add_record(payload: AddRecordIn, _: dict = Depends(require_write)):
             user_name=payload.user_name,
             boxid=payload.boxid,
             ttn=payload.ttn,
-            datetime=datetime.now(),
+            datetime=now_local(),
             note=note
         )
         db.add(rec)
@@ -1563,7 +1565,7 @@ def add_record(payload: AddRecordIn, _: dict = Depends(require_write)):
                 user_name=payload.user_name,
                 boxid=payload.boxid,
                 ttn=payload.ttn,
-                datetime=datetime.now(),
+                datetime=now_local(),
                 error_message=err_msg
             )
             db.add(err)
@@ -1637,7 +1639,7 @@ def add_error(payload: AddErrorIn, _: dict = Depends(require_write)):
             user_name=payload.user_name,
             boxid=payload.boxid,
             ttn=payload.ttn,
-            datetime=datetime.now(),
+            datetime=now_local(),
             error_message=payload.message
         )
         db.add(err)
