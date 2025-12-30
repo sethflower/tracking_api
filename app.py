@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
 from typing import Optional, List
 
 from dotenv import load_dotenv
@@ -63,12 +62,8 @@ ScanPakSessionLocal = sessionmaker(
 
 app = FastAPI(title="TrackingApp API", version="1.3")
 
-APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Kyiv")
-APP_TZ = ZoneInfo(APP_TIMEZONE)
-
-
 def now_local() -> datetime:
-    return datetime.now(APP_TZ).replace(tzinfo=None)
+    return datetime.now()
 
 HISTORY_RETENTION_HOURS = 10
 
